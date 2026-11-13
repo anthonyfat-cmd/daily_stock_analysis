@@ -1,0 +1,110 @@
+                  app_one = app.loc[app["Ticker"] == ticker].copy()
+                  invalid_app = bad_bar_count(app_one)
+                  app_source = ",".join(sorted(set(app_one["DataSource"].dropna().astype(str))))
+                  app_last = str(app_one["Date"].max()) if len(app_one) else ""
+                  if db_error:
+                      notes.append(db_error)
+                  if len(app_one) < 10:
+                      notes.append(f"App has only {len(app_one)} rows; minimum 10")
+                  if invalid_app:
+                      notes.append(f"App OHLCV invalid rows: {invalid_app}")
+                  if app_last and days_old(app_last) > 10:
+                      notes.append(f"App data stale: {app_last}")
+                  if app_one["Date"].duplicated().any():
+                      notes.append("App contains duplicate dates")
+          
+                  y_rows = 0
+                  y_last = ""
+                  matched = 0
+                  mean_diff = ""
+                  max_diff = ""
+                  invalid_y = 0
+                  try:
+                      yahoo = download_extended(ticker)
+                      y_rows = len(yahoo)
+                      y_last = str(yahoo["Date"].iloc[-1])
+                      invalid_y = bad_bar_count(yahoo)
+                      if y_rows < 200:
+                          notes.append(f"Yahoo has only {y_rows} rows; SMA200 needs at least 200")
+                      if invalid_y:
+                          notes.append(f"Yahoo OHLCV invalid rows: {invalid_y}")
+                      if days_old(y_last) > 10:
+                          notes.append(f"Yahoo data stale: {y_last}")
+                      if len(app_one):
+                          overlap = app_one[["Date", "Close"]].merge(
+                              yahoo[["Date", "Close"]], on="Date", how="inner", suffixes=("_app", "_yf")
+                          )
+                          matched = len(overlap)
+                          if matched < 10:
+                              notes.append(f"Insufficient app vs Yahoo overlap: {matched} days")
+                          if matched:
+                              differences = ((overlap["Close_app"] - overlap["Close_yf"]).abs()
+                                             / overlap["Close_yf"].abs().replace(0, float("nan")) * 100)
+                              mean_diff = round(float(differences.mean()), 4)
+                              max_diff = round(float(differences.max()), 4)
+                              if max_diff > 1.0:
+                                  notes.append("Close price differs >1% on some dates; check adjustments/source")
+                      extended_parts.append(yahoo.tail(60))
+                  except Exception as exc:
+                      notes.append(f"Extended history download failed: {type(exc).__name__}: {exc}")
+          
+                  critical = (db_error or len(app_one) < 10 or invalid_app > 0
+                              or (app_last and days_old(app_last) > 10)
+                              or y_rows < 200 or invalid_y > 0
+                              or (y_last and days_old(y_last) > 10)
+                              or matched < 10)
+                  if critical:
+                      failed = True
+                  result = "FAIL" if critical else ("REVIEW" if max_diff != "" and max_diff > 1.0 else "PASS")
+                  report.append(dict(Ticker=ticker, AppRows=len(app_one), AppLastDate=app_last,
+                                     AppSource=app_source, YahooRows=y_rows, YahooLastDate=y_last,
+                                     ComparedRows=matched, MeanCloseDifferencePct=mean_diff,
+                                     MaxCloseDifferencePct=max_diff, InvalidAppBars=invalid_app,
+                                     InvalidYahooBars=invalid_y, Result=result, Notes="; ".join(notes)))
+                  print(f"{ticker}: {result} | app={len(app_one)} rows | extended={y_rows} rows | "
+                        f"overlap={matched} | latest={y_last} | {report[-1]['Notes']}")
+          
+              write_rows(OUTPUT / "validation_summary.csv", SUMMARY_COLS, report)
+              combined = pd.concat(extended_parts, ignore_index=True) if extended_parts else pd.DataFrame(columns=EXT_COLS)
+              combined.to_csv(OUTPUT / "extended_ohlcv_indicators.csv", columns=list(EXT_COLS), index=False,
+                              float_format="%.6f")
+              guidance = [
+                  "# US Stock Data Validation — Phase 2",
+                  "",
+                  "GitHub-hosted run, no broker accounts or API keys.",
+                  "",
+                  "Files: app_ohlcv.csv = application's stored bars (normally around 30 calendar days).",
+                  "extended_ohlcv_indicators.csv = last 60 trading sessions, using 2 years of Yahoo Finance",
+                  "  adjusted OHLC data to warm up EMA9/21, SMA50/200 and volume indicators.",
+                  "validation_summary.csv = missing/stale/invalid bars and app/Yahoo overlapping closes.",
+                  "",
+                  "IMPORTANT: Yahoo is not an independent cross-check if the app itself used Yahoo/yfinance.",
+                  "Adjusted OHLC may differ from unadjusted broker or chart prices, especially around dividends.",
+                  "20-day high breakout is a mechanical screening feature, NOT a VCP/PVP/PPP buy signal.",
+                  "PASS means basic structural checks passed, NOT that a trading strategy is validated.",
+                  "",
+                  "## Results",
+              ]
+              guidance += [f"- {r['Ticker']}: {r['Result']} (app={r['AppRows']}, history={r['YahooRows']}, "
+                           f"overlap={r['ComparedRows']}, max close delta={r['MaxCloseDifferencePct']}%) "
+                           f"{r['Notes']}" for r in report]
+              (OUTPUT / "report.md").write_text("\n".join(guidance) + "\n", encoding="utf-8")
+              summary_path = os.environ.get("GITHUB_STEP_SUMMARY")
+              if summary_path:
+                  with open(summary_path, "a", encoding="utf-8") as handle:
+                      handle.write("\n".join(guidance) + "\n")
+              return 1 if failed else 0
+          
+          
+          if __name__ == "__main__":
+              raise SystemExit(main())
+          PYVALIDATION
+
+      - name: Upload reports (even if validation fails)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stock-data-validation-reports
+          path: validation-results/
+          if-no-files-found: warn
+          retention-days: 7
