@@ -1,3 +1,163 @@
+name: Stock Data Validation - Phase 2
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  stock-data-validation:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    env:
+      STOCK_LIST: AAPL,NVDA,GOOG
+      DATABASE_PATH: ./data/stock_analysis.db
+      WEBUI_ENABLED: 'false'
+      SCHEDULE_ENABLED: 'false'
+      ADMIN_AUTH_ENABLED: 'true'
+      MARKET_REVIEW_REGION: us
+    steps:
+      - name: Checkout fork without persisted token
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install project dependencies (isolated runner, no secrets)
+        run: python -m pip install -r requirements.txt
+
+      - name: App dry-run (data only, no AI, no notifications)
+        continue-on-error: true
+        run: python main.py --dry-run --stocks AAPL,NVDA,GOOG --no-notify --no-market-review --force-run
+
+      - name: Export data and validate OHLCV, EMA, SMA and volume
+        run: |
+          python - <<'PYVALIDATION'
+          """Read-only validation/export of daily_stock_analysis dry-run market data.
+          Runs on an ephemeral GitHub-hosted runner; no API keys or brokerage access.
+          """
+          from __future__ import annotations
+          
+          import csv
+          import os
+          import sqlite3
+          from datetime import datetime, timezone
+          from pathlib import Path
+          
+          import pandas as pd
+          import yfinance as yf
+          
+          SYMBOLS = ("AAPL", "NVDA", "GOOG")
+          OUTPUT = Path("validation-results")
+          OUTPUT.mkdir(exist_ok=True)
+          DB_PATH = Path(os.environ.get("DATABASE_PATH", "./data/stock_analysis.db"))
+          
+          APP_COLS = ("Ticker", "Date", "Open", "High", "Low", "Close", "Volume", "DataSource")
+          EXT_COLS = ("Ticker", "Date", "Open", "High", "Low", "Close", "Volume",
+                      "EMA9", "EMA21", "SMA50", "SMA200", "AvgVolume20", "VolumeRatio20",
+                      "Prior20DayHigh", "AbovePrior20DayHigh")
+          SUMMARY_COLS = ("Ticker", "AppRows", "AppLastDate", "AppSource", "YahooRows",
+                          "YahooLastDate", "ComparedRows", "MeanCloseDifferencePct",
+                          "MaxCloseDifferencePct", "InvalidAppBars", "InvalidYahooBars", "Result", "Notes")
+          
+          
+          def write_rows(path: Path, headers: tuple[str, ...], rows: list[dict]):
+              with path.open("w", newline="", encoding="utf-8") as f:
+                  w = csv.DictWriter(f, fieldnames=headers, extrasaction="ignore")
+                  w.writeheader()
+                  w.writerows(rows)
+          
+          
+          def bad_bar_count(frame: pd.DataFrame) -> int:
+              if frame.empty:
+                  return 0
+              p = frame[["Open", "High", "Low", "Close", "Volume"]].apply(pd.to_numeric, errors="coerce")
+              invalid = (p.isna().any(axis=1) | (p[["Open", "High", "Low", "Close"]] <= 0).any(axis=1)
+                         | (p["Volume"] < 0)
+                         | (p["High"] + 1e-7 < p[["Open", "Close", "Low"]].max(axis=1))
+                         | (p["Low"] - 1e-7 > p[["Open", "Close", "High"]].min(axis=1)))
+              return int(invalid.sum())
+          
+          
+          def read_app_data() -> tuple[pd.DataFrame, str | None]:
+              if not DB_PATH.is_file():
+                  return pd.DataFrame(columns=APP_COLS), f"App database missing: {DB_PATH}"
+              try:
+                  # Open SQLite read-only so validation cannot modify the app's data.
+                  with sqlite3.connect(f"file:{DB_PATH.resolve().as_posix()}?mode=ro", uri=True) as conn:
+                      qmarks = ",".join("?" for _ in SYMBOLS)
+                      rows = conn.execute(
+                          "SELECT code, date, open, high, low, close, volume, data_source "
+                          f"FROM stock_daily WHERE code IN ({qmarks}) ORDER BY code, date",
+                          SYMBOLS,
+                      ).fetchall()
+              except sqlite3.Error as exc:
+                  return pd.DataFrame(columns=APP_COLS), f"Unable to read stock_daily: {exc}"
+              result = pd.DataFrame(rows, columns=APP_COLS)
+              if not result.empty:
+                  result["Date"] = pd.to_datetime(result["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+              return result, None
+          
+          
+          def download_extended(ticker: str) -> pd.DataFrame:
+              # 2 years provides enough warm-up history to calculate SMA200.
+              bars = yf.download(
+                  ticker, period="2y", interval="1d", auto_adjust=True,
+                  progress=False, threads=False, multi_level_index=False,
+              )
+              if bars is None or bars.empty:
+                  raise ValueError("Yahoo Finance returned no rows")
+              if isinstance(bars.columns, pd.MultiIndex):
+                  if "Close" in bars.columns.get_level_values(0):
+                      bars.columns = bars.columns.get_level_values(0)
+                  else:
+                      bars.columns = bars.columns.get_level_values(-1)
+              bars = bars.reset_index()
+              if "Date" not in bars.columns:
+                  raise ValueError(f"Unexpected Yahoo columns: {list(bars.columns)}")
+              bars["Date"] = pd.to_datetime(bars["Date"], errors="coerce").dt.strftime("%Y-%m-%d")
+              needed = ["Date", "Open", "High", "Low", "Close", "Volume"]
+              bars = bars[needed].dropna(subset=["Date"]).sort_values("Date").reset_index(drop=True)
+              for col in needed[1:]:
+                  bars[col] = pd.to_numeric(bars[col], errors="coerce")
+              if bars["Date"].duplicated().any():
+                  raise ValueError("Duplicate dates from Yahoo Finance")
+              bars.insert(0, "Ticker", ticker)
+              bars["EMA9"] = bars["Close"].ewm(span=9, adjust=False, min_periods=9).mean()
+              bars["EMA21"] = bars["Close"].ewm(span=21, adjust=False, min_periods=21).mean()
+              bars["SMA50"] = bars["Close"].rolling(50, min_periods=50).mean()
+              bars["SMA200"] = bars["Close"].rolling(200, min_periods=200).mean()
+              bars["AvgVolume20"] = bars["Volume"].rolling(20, min_periods=20).mean()
+              bars["VolumeRatio20"] = bars["Volume"].div(bars["AvgVolume20"].replace(0, float("nan")))
+              bars["Prior20DayHigh"] = bars["High"].shift(1).rolling(20, min_periods=20).max()
+              bars["AbovePrior20DayHigh"] = bars["Close"] > bars["Prior20DayHigh"]
+              return bars
+          
+          
+          def days_old(iso_date: str) -> int:
+              day = datetime.strptime(iso_date, "%Y-%m-%d").date()
+              return (datetime.now(timezone.utc).date() - day).days
+          
+          
+          def main() -> int:
+              # Deterministic indicator smoke test, independent of market-data source.
+              flat = pd.Series([10.0] * 220)
+              assert abs(flat.ewm(span=9, adjust=False).mean().iloc[-1] - 10.0) < 1e-10
+              assert abs(flat.rolling(200).mean().iloc[-1] - 10.0) < 1e-10
+          
+              app, db_error = read_app_data()
+              write_rows(OUTPUT / "app_ohlcv.csv", APP_COLS, app.to_dict("records"))
+          
+              extended_parts: list[pd.DataFrame] = []
+              report: list[dict] = []
+              failed = False
+              for ticker in SYMBOLS:
+                  notes: list[str] = []
                   app_one = app.loc[app["Ticker"] == ticker].copy()
                   invalid_app = bad_bar_count(app_one)
                   app_source = ",".join(sorted(set(app_one["DataSource"].dropna().astype(str))))
