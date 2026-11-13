@@ -1,0 +1,34 @@
+name: Safe Stock Data Test (Manual Only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  data-test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout public code without saving credentials
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up isolated Python on GitHub runner
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install project dependencies (no secrets configured)
+        run: python -m pip install -r requirements.txt
+
+      - name: Test public US stock data only (no AI, no notifications, no Web UI)
+        env:
+          STOCK_LIST: AAPL,NVDA,GOOG
+          WEBUI_ENABLED: 'false'
+          SCHEDULE_ENABLED: 'false'
+          ADMIN_AUTH_ENABLED: 'true'
+          MARKET_REVIEW_REGION: us
+        run: python main.py --dry-run --stocks AAPL,NVDA,GOOG --no-notify --no-market-review --force-run
